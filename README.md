@@ -8,7 +8,16 @@ Async fair-share semaphore for multi-tenant resource management in Python.
 
 ## What is it?
 
-`aio-fairshare` distributes a fixed pool of resources (e.g., browser tabs, database connections, API slots) **fairly** among active tenants. Unlike a regular semaphore, it dynamically adjusts each tenant's share as tenants join or leave.
+`aio-fairshare` distributes a fixed pool of resources **fairly** among active tenants. Unlike a regular semaphore, it dynamically adjusts each tenant's share as tenants join or leave.
+
+**Best suited for:**
+- Browser tabs / pages (Playwright, Puppeteer)
+- Worker processes / threads
+- Shared API clients with concurrent connection limits
+
+**Not suited for:**
+- Database connection pools (use asyncpg/SQLAlchemy built-in pools)
+- Rate limiting (use `aiolimiter` instead)
 
 ### The Problem
 
@@ -97,6 +106,36 @@ await asyncio.gather(
     scrape_urls("req-2", ["https://example3.com", "https://example4.com"]),
 )
 ```
+
+## Real-World Example: Shared API Client
+
+Use when multiple services share one API client with a **concurrent connection limit** (not rate limit):
+
+```python
+import httpx
+from aio_fairshare import FairShareSemaphore
+
+# API allows max 10 concurrent requests
+api_semaphore = FairShareSemaphore(max_slots=10)
+client = httpx.AsyncClient()
+
+async def call_api(service_name: str, endpoints: list[str]):
+    """Multiple internal services share the same API client."""
+    async with api_semaphore.tenant(service_name):
+        async def fetch(endpoint: str):
+            async with api_semaphore.acquire():
+                return await client.get(f"https://api.example.com/{endpoint}")
+        
+        return await asyncio.gather(*[fetch(ep) for ep in endpoints])
+
+# Service A and Service B fairly share the 10 concurrent slots
+await asyncio.gather(
+    call_api("service-a", ["users", "orders", "products"]),
+    call_api("service-b", ["inventory", "shipping"]),
+)
+```
+
+> **Note:** If you need rate limiting (e.g., 100 requests/minute), use [`aiolimiter`](https://github.com/mjpieters/aiolimiter) instead.
 
 ## API Reference
 
