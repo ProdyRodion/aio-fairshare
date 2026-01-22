@@ -2,7 +2,7 @@
 
 Async fair-share semaphore for multi-tenant resource management in Python.
 
-[![PyPI version](https://badge.fury.io/py/aio-fairshare.svg)](https://badge.fury.io/py/aio-fairshare)
+[![PyPI version](https://img.shields.io/pypi/v/aio-fairshare)](https://pypi.org/project/aio-fairshare/)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
