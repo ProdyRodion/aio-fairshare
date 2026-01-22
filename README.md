@@ -107,7 +107,6 @@ FairShareSemaphore(
     max_slots: int,
     *,
     min_share: int = 1,
-    poll_interval: float = 0.01,
     share_calculator: Callable[[int, int], int] | None = None,
 )
 ```
@@ -115,8 +114,7 @@ FairShareSemaphore(
 **Parameters:**
 - `max_slots`: Maximum number of concurrent slots
 - `min_share`: Minimum slots guaranteed per tenant (default: 1)
-- `poll_interval`: Seconds between acquisition attempts (default: 0.01)
-- `share_calculator`: Custom function to calculate per-tenant share
+- `share_calculator`: Custom function to calculate per-tenant share. Receives `(max_slots, num_demanding_tenants)` and returns share per tenant.
 
 ### Methods
 
@@ -144,11 +142,12 @@ async with semaphore.acquire():
 
 #### `stats() -> SemaphoreStats`
 
-Get current statistics.
+Get current statistics (thread-safe).
 
 ```python
 stats = await semaphore.stats()
 print(f"Active tenants: {stats.active_tenants}")
+print(f"Demanding tenants: {stats.demanding_tenants}")
 print(f"Available slots: {stats.available_slots}")
 ```
 
@@ -169,24 +168,26 @@ async with tenant_context("my-tenant"):
 
 ## How Fair Sharing Works
 
-| Tenants | Max Slots | Share per Tenant |
-|---------|-----------|------------------|
-| 1       | 10        | 10               |
-| 2       | 10        | 5                |
-| 3       | 10        | 3                |
-| 5       | 10        | 2                |
-| 10      | 10        | 1                |
+| Demanding Tenants | Max Slots | Share per Tenant |
+|-------------------|-----------|------------------|
+| 1                 | 10        | 10               |
+| 2                 | 10        | 5                |
+| 3                 | 10        | 3                |
+| 5                 | 10        | 2                |
+| 10                | 10        | 1                |
 
-The share is recalculated **dynamically** whenever a tenant joins or leaves.
+**Note:** Only "demanding" tenants (those with active slots or waiting for slots) are counted for share calculation. Idle registered tenants don't reduce others' shares.
+
+The share is recalculated **dynamically** whenever a tenant joins, leaves, or becomes demanding.
 
 ## Custom Share Calculator
 
 You can provide a custom function to calculate shares:
 
 ```python
-def priority_calculator(max_slots: int, num_tenants: int) -> int:
+def priority_calculator(max_slots: int, num_demanding_tenants: int) -> int:
     """Give each tenant a bit more than equal share."""
-    return max_slots // num_tenants + 2
+    return max_slots // num_demanding_tenants + 2
 
 semaphore = FairShareSemaphore(
     max_slots=20,
@@ -202,6 +203,8 @@ semaphore = FairShareSemaphore(
 | Per-tenant limit | ❌ | ✅ (fixed) | ✅ (dynamic) |
 | Fair sharing | ❌ | ❌ | ✅ |
 | Dynamic adjustment | ❌ | ❌ | ✅ |
+| FIFO ordering | ❌ | ❌ | ✅ |
+| Cancellation safe | ✅ | ✅ | ✅ |
 | Zero dependencies | ✅ | ✅ | ✅ |
 
 ## Development
@@ -211,17 +214,23 @@ semaphore = FairShareSemaphore(
 git clone https://github.com/yourusername/aio-fairshare
 cd aio-fairshare
 
-# Install dev dependencies
-pip install -e ".[dev]"
+# Install dependencies with Poetry
+poetry install
 
 # Run tests
-pytest
+poetry run pytest -v
 
 # Run linter
-ruff check .
+poetry run ruff check .
 
 # Run type checker
-mypy aio_fairshare
+poetry run mypy aio_fairshare
+
+# Build package
+poetry build
+
+# Publish to PyPI
+poetry publish
 ```
 
 ## License

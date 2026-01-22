@@ -9,16 +9,20 @@ tenants join or leave.
 from .semaphore import (
     FairShareSemaphore,
     TenantContext,
-    set_tenant_id,
+    TenantHasActiveSlotsError,
+    TenantNotRegisteredError,
     get_tenant_id,
+    set_tenant_id,
     tenant_context,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
     "FairShareSemaphore",
     "TenantContext",
-    "set_tenant_id",
+    "TenantHasActiveSlotsError",
+    "TenantNotRegisteredError",
     "get_tenant_id",
+    "set_tenant_id",
     "tenant_context",
 ]

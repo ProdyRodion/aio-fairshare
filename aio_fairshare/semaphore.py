@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import deque
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Callable
+from typing import Any
 
 logger = logging.getLogger("aio_fairshare")
 
@@ -17,7 +19,7 @@ logger = logging.getLogger("aio_fairshare")
 _tenant_id_var: ContextVar[str | None] = ContextVar("_tenant_id", default=None)
 
 
-def set_tenant_id(tenant_id: str) -> None:
+def set_tenant_id(tenant_id: str | None) -> None:
     """Set the current tenant ID in the context."""
     _tenant_id_var.set(tenant_id)
 
@@ -39,12 +41,20 @@ async def tenant_context(tenant_id: str) -> AsyncIterator[None]:
 
 class TenantNotRegisteredError(RuntimeError):
     """Raised when trying to acquire without a registered tenant."""
+
+    pass
+
+
+class TenantHasActiveSlotsError(RuntimeError):
+    """Raised when trying to unregister a tenant with active slots."""
+
     pass
 
 
 @dataclass
 class TenantStats:
     """Statistics for a single tenant."""
+
     tenant_id: str
     active_slots: int
     share: int
@@ -54,17 +64,28 @@ class TenantStats:
 @dataclass
 class SemaphoreStats:
     """Overall semaphore statistics."""
+
     max_slots: int
     active_tenants: int
+    demanding_tenants: int
     total_active_slots: int
     available_slots: int
     tenants: dict[str, TenantStats] = field(default_factory=dict)
 
 
+@dataclass
+class _TenantState:
+    """Internal state for a tenant."""
+
+    active_slots: int = 0
+    waiting: int = 0
+    closing: bool = False  # Marked for deferred unregistration
+
+
 class TenantContext:
     """
     Manages a tenant's lifecycle within the semaphore.
-    
+
     Use as async context manager:
         async with semaphore.tenant("request-123"):
             # tenant is registered
@@ -72,20 +93,25 @@ class TenantContext:
                 # slot acquired
                 ...
     """
-    
-    def __init__(self, semaphore: FairShareSemaphore, tenant_id: str):
+
+    def __init__(self, semaphore: FairShareSemaphore, tenant_id: str) -> None:
         self._semaphore = semaphore
         self._tenant_id = tenant_id
-    
+
     async def __aenter__(self) -> TenantContext:
         await self._semaphore.register_tenant(self._tenant_id)
         set_tenant_id(self._tenant_id)
         return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
         await self._semaphore.unregister_tenant(self._tenant_id)
         _tenant_id_var.set(None)
-    
+
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator[None]:
         """Acquire a slot for this tenant."""
@@ -95,166 +121,289 @@ class TenantContext:
 
 class _SlotAcquisition:
     """Internal context manager for slot acquisition."""
-    
-    def __init__(self, semaphore: FairShareSemaphore, tenant_id: str):
+
+    def __init__(self, semaphore: FairShareSemaphore, tenant_id: str) -> None:
         self._semaphore = semaphore
         self._tenant_id = tenant_id
         self._acquired = False
-    
+
     async def __aenter__(self) -> _SlotAcquisition:
         sem = self._semaphore
-        
-        # Increment waiting count
+
+        # Register as waiting
         async with sem._lock:
             if self._tenant_id not in sem._tenants:
                 raise TenantNotRegisteredError(
                     f"Tenant '{self._tenant_id}' is not registered. "
                     "Use 'async with semaphore.tenant(id):' first."
                 )
-            sem._waiting[self._tenant_id] = sem._waiting.get(self._tenant_id, 0) + 1
-        
+            tenant = sem._tenants[self._tenant_id]
+            if tenant.closing:
+                raise TenantNotRegisteredError(f"Tenant '{self._tenant_id}' is closing.")
+            tenant.waiting += 1
+
         try:
             while True:
-                # Check if we can proceed based on fair share
                 async with sem._lock:
                     share = sem._calculate_share()
-                    used = sem._tenants.get(self._tenant_id, 0)
-                    
-                    if used < share:
-                        # Try to acquire global semaphore without blocking
-                        if sem._available > 0:
-                            sem._available -= 1
-                            sem._tenants[self._tenant_id] = used + 1
-                            self._acquired = True
-                            return self
-                
-                # Wait a bit before retrying
-                await asyncio.sleep(sem._poll_interval)
-        finally:
-            # Decrement waiting count
+                    tenant_state = sem._tenants.get(self._tenant_id)
+
+                    if tenant_state is None or tenant_state.closing:
+                        raise TenantNotRegisteredError(
+                            f"Tenant '{self._tenant_id}' was unregistered."
+                        )
+
+                    # Check if we can acquire
+                    if tenant_state.active_slots < share and sem._available > 0:
+                        sem._available -= 1
+                        tenant_state.active_slots += 1
+                        self._acquired = True
+                        return self
+
+                    # Need to wait - add to queue
+                    waiter: asyncio.Future[None] = asyncio.get_event_loop().create_future()
+                    sem._waiters.append((self._tenant_id, waiter))
+
+                # Wait for signal (outside lock)
+                try:
+                    await waiter
+                except asyncio.CancelledError:
+                    # Remove from waiters if still there
+                    async with sem._lock:
+                        sem._waiters = deque(
+                            (tid, w) for tid, w in sem._waiters if w is not waiter
+                        )
+                    raise
+
+        except (asyncio.CancelledError, Exception):
+            # Rollback waiting count on any error
             async with sem._lock:
-                sem._waiting[self._tenant_id] = max(
-                    0, sem._waiting.get(self._tenant_id, 0) - 1
-                )
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+                tenant_state = sem._tenants.get(self._tenant_id)
+                if tenant_state:
+                    tenant_state.waiting = max(0, tenant_state.waiting - 1)
+
+                # Rollback acquisition if it happened
+                if self._acquired:
+                    if tenant_state:
+                        tenant_state.active_slots = max(0, tenant_state.active_slots - 1)
+                    sem._available += 1
+                    self._acquired = False
+                    sem._notify_waiters()
+            raise
+
+        finally:
+            # Decrement waiting count on successful acquisition
+            if self._acquired:
+                async with sem._lock:
+                    tenant_state = sem._tenants.get(self._tenant_id)
+                    if tenant_state:
+                        tenant_state.waiting = max(0, tenant_state.waiting - 1)
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any,
+    ) -> None:
         if self._acquired:
             sem = self._semaphore
             async with sem._lock:
-                sem._tenants[self._tenant_id] = max(
-                    0, sem._tenants.get(self._tenant_id, 0) - 1
-                )
+                tenant_state = sem._tenants.get(self._tenant_id)
+                if tenant_state:
+                    tenant_state.active_slots = max(0, tenant_state.active_slots - 1)
+
+                    # Check for deferred unregistration
+                    if (
+                        tenant_state.closing
+                        and tenant_state.active_slots == 0
+                        and tenant_state.waiting == 0
+                    ):
+                        del sem._tenants[self._tenant_id]
+                        logger.debug(f"Deferred unregister of tenant '{self._tenant_id}'")
+
                 sem._available += 1
+                sem._notify_waiters()
 
 
 class FairShareSemaphore:
     """
     Async semaphore that fairly distributes slots among active tenants.
-    
+
     Args:
         max_slots: Maximum number of concurrent slots (e.g., browser tabs).
         min_share: Minimum slots guaranteed per tenant (default: 1).
-        poll_interval: Seconds between acquisition attempts (default: 0.01).
         share_calculator: Optional custom function to calculate per-tenant share.
-            Receives (max_slots, num_tenants) and returns share per tenant.
-    
+            Receives (max_slots, num_demanding_tenants) and returns share per tenant.
+
     Example:
         semaphore = FairShareSemaphore(max_slots=10)
-        
+
         async with semaphore.tenant("request-123"):
             async with semaphore.acquire():
                 # Do work with acquired slot
                 await process_page()
-    
+
     Fair sharing:
-        - With 10 slots and 2 tenants: each gets up to 5 slots
-        - With 10 slots and 5 tenants: each gets up to 2 slots
+        - With 10 slots and 2 demanding tenants: each gets up to 5 slots
+        - With 10 slots and 5 demanding tenants: each gets up to 2 slots
         - Shares are recalculated dynamically as tenants join/leave
+        - Only "demanding" tenants (active_slots > 0 or waiting > 0) count for share calculation
     """
-    
+
     def __init__(
         self,
         max_slots: int,
         *,
         min_share: int = 1,
-        poll_interval: float = 0.01,
         share_calculator: Callable[[int, int], int] | None = None,
-    ):
+    ) -> None:
         if max_slots < 1:
             raise ValueError("max_slots must be at least 1")
         if min_share < 1:
             raise ValueError("min_share must be at least 1")
-        
+
         self._max_slots = max_slots
         self._min_share = min_share
-        self._poll_interval = poll_interval
         self._share_calculator = share_calculator
-        
+
         self._lock = asyncio.Lock()
         self._available = max_slots
-        self._tenants: dict[str, int] = {}  # tenant_id -> active slots
-        self._waiting: dict[str, int] = {}  # tenant_id -> waiting count
-    
+        self._tenants: dict[str, _TenantState] = {}
+        self._waiters: deque[tuple[str, asyncio.Future[None]]] = deque()
+
     @property
     def max_slots(self) -> int:
         """Maximum number of slots."""
         return self._max_slots
-    
+
+    def _get_demanding_tenants_count(self) -> int:
+        """Count tenants that are actively using or waiting for slots."""
+        return sum(
+            1
+            for t in self._tenants.values()
+            if (t.active_slots > 0 or t.waiting > 0) and not t.closing
+        )
+
     def _calculate_share(self) -> int:
-        """Calculate fair share per tenant."""
-        num_tenants = max(1, len(self._tenants))
-        
+        """Calculate fair share per tenant based on demanding tenants."""
+        num_demanding = self._get_demanding_tenants_count()
+        if num_demanding == 0:
+            return self._max_slots
+
         if self._share_calculator:
-            return max(self._min_share, self._share_calculator(self._max_slots, num_tenants))
-        
-        return max(self._min_share, self._max_slots // num_tenants)
-    
+            return max(
+                self._min_share, self._share_calculator(self._max_slots, num_demanding)
+            )
+
+        return max(self._min_share, self._max_slots // num_demanding)
+
+    def _notify_waiters(self) -> None:
+        """Wake up waiters in FIFO order, respecting fair share."""
+        if not self._waiters or self._available == 0:
+            return
+
+        share = self._calculate_share()
+        notified: list[tuple[str, asyncio.Future[None]]] = []
+
+        for tenant_id, waiter in self._waiters:
+            if waiter.done():
+                notified.append((tenant_id, waiter))
+                continue
+
+            tenant_state = self._tenants.get(tenant_id)
+            if tenant_state is None or tenant_state.closing:
+                waiter.cancel()
+                notified.append((tenant_id, waiter))
+                continue
+
+            # Check if tenant can acquire based on fair share
+            if tenant_state.active_slots < share and self._available > 0:
+                waiter.set_result(None)
+                notified.append((tenant_id, waiter))
+                # Don't decrement available here - let __aenter__ do it
+                # This ensures atomicity
+
+        # Remove notified waiters
+        for item in notified:
+            try:
+                self._waiters.remove(item)
+            except ValueError:
+                pass
+
     async def register_tenant(self, tenant_id: str) -> None:
         """Register a tenant to participate in fair sharing."""
         async with self._lock:
             if tenant_id not in self._tenants:
-                self._tenants[tenant_id] = 0
-                self._waiting[tenant_id] = 0
-                logger.debug(f"Registered tenant '{tenant_id}', total: {len(self._tenants)}")
-    
-    async def unregister_tenant(self, tenant_id: str) -> None:
+                self._tenants[tenant_id] = _TenantState()
+                logger.debug(
+                    f"Registered tenant '{tenant_id}', total: {len(self._tenants)}"
+                )
+            elif self._tenants[tenant_id].closing:
+                # Re-register a closing tenant
+                self._tenants[tenant_id].closing = False
+                logger.debug(f"Re-registered closing tenant '{tenant_id}'")
+
+    async def unregister_tenant(self, tenant_id: str, force: bool = False) -> None:
         """
         Unregister a tenant.
-        
-        Note: Should only be called when tenant has released all slots.
+
+        Args:
+            tenant_id: The tenant to unregister.
+            force: If True, immediately unregister even with active slots (leaks slots).
+                   If False (default), uses deferred unregistration.
+
+        Raises:
+            TenantHasActiveSlotsError: If force=False and tenant has active slots,
+                                       and deferred mode is not possible.
         """
         async with self._lock:
-            active = self._tenants.get(tenant_id, 0)
-            if active > 0:
-                logger.warning(
-                    f"Unregistering tenant '{tenant_id}' with {active} active slots. "
-                    "Slots will be released."
+            tenant_state = self._tenants.get(tenant_id)
+            if tenant_state is None:
+                return
+
+            if tenant_state.active_slots == 0 and tenant_state.waiting == 0:
+                # Safe to unregister immediately
+                del self._tenants[tenant_id]
+                logger.debug(
+                    f"Unregistered tenant '{tenant_id}', remaining: {len(self._tenants)}"
                 )
-                self._available += active
-            
-            self._tenants.pop(tenant_id, None)
-            self._waiting.pop(tenant_id, None)
-            logger.debug(f"Unregistered tenant '{tenant_id}', remaining: {len(self._tenants)}")
-    
+            elif force:
+                # Force unregister - WARNING: leaks slots
+                logger.warning(
+                    f"Force unregistering tenant '{tenant_id}' with {tenant_state.active_slots} "
+                    f"active slots - slots will be leaked!"
+                )
+                del self._tenants[tenant_id]
+            else:
+                # Deferred unregistration
+                tenant_state.closing = True
+                logger.debug(
+                    f"Marked tenant '{tenant_id}' for deferred unregistration "
+                    f"(active: {tenant_state.active_slots}, waiting: {tenant_state.waiting})"
+                )
+
+            # Recalculate shares and notify waiters
+            self._notify_waiters()
+
     def tenant(self, tenant_id: str) -> TenantContext:
         """
         Create a tenant context.
-        
+
         Usage:
             async with semaphore.tenant("request-123"):
                 async with semaphore.acquire():
                     ...
         """
         return TenantContext(self, tenant_id)
-    
+
     @asynccontextmanager
     async def acquire(self, tenant_id: str | None = None) -> AsyncIterator[None]:
         """
         Acquire a slot, respecting fair share limits.
-        
+
         Args:
             tenant_id: Optional tenant ID. If not provided, uses context variable.
-        
+
         Raises:
             TenantNotRegisteredError: If tenant is not registered.
         """
@@ -263,46 +412,67 @@ class FairShareSemaphore:
             raise TenantNotRegisteredError(
                 "No tenant ID provided. Either pass tenant_id or use tenant_context()."
             )
-        
+
         async with _SlotAcquisition(self, tid):
             yield
-    
+
     async def stats(self) -> SemaphoreStats:
-        """Get current semaphore statistics."""
+        """Get current semaphore statistics (thread-safe)."""
         async with self._lock:
+            demanding = self._get_demanding_tenants_count()
             share = self._calculate_share()
+
             tenant_stats = {
                 tid: TenantStats(
                     tenant_id=tid,
-                    active_slots=slots,
+                    active_slots=state.active_slots,
                     share=share,
-                    waiting=self._waiting.get(tid, 0),
+                    waiting=state.waiting,
                 )
-                for tid, slots in self._tenants.items()
+                for tid, state in self._tenants.items()
+                if not state.closing
             }
-            
+
             return SemaphoreStats(
                 max_slots=self._max_slots,
-                active_tenants=len(self._tenants),
+                active_tenants=len(
+                    [t for t in self._tenants.values() if not t.closing]
+                ),
+                demanding_tenants=demanding,
                 total_active_slots=self._max_slots - self._available,
                 available_slots=self._available,
                 tenants=tenant_stats,
             )
-    
-    def stats_sync(self) -> dict:
+
+    def _stats_sync_unsafe(self) -> dict[str, Any]:
         """
-        Get current statistics synchronously (for logging/debugging).
-        
-        Note: May not be 100% accurate due to lack of locking.
+        Get current statistics synchronously (NOT thread-safe).
+
+        WARNING: This method reads state without locking and may return
+        inconsistent data. Use only for debugging/logging where approximate
+        values are acceptable. Prefer `await stats()` for accurate data.
         """
-        share = self._calculate_share() if self._tenants else self._max_slots
+        demanding = sum(
+            1
+            for t in self._tenants.values()
+            if (t.active_slots > 0 or t.waiting > 0) and not t.closing
+        )
+        share = self._calculate_share() if demanding > 0 else self._max_slots
+
         return {
             "max_slots": self._max_slots,
-            "active_tenants": len(self._tenants),
+            "active_tenants": len(
+                [t for t in self._tenants.values() if not t.closing]
+            ),
+            "demanding_tenants": demanding,
             "available_slots": self._available,
             "share_per_tenant": share,
             "tenants": {
-                tid: {"active": slots, "waiting": self._waiting.get(tid, 0)}
-                for tid, slots in self._tenants.items()
+                tid: {
+                    "active": state.active_slots,
+                    "waiting": state.waiting,
+                    "closing": state.closing,
+                }
+                for tid, state in self._tenants.items()
             },
         }
