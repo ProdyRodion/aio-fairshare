@@ -51,7 +51,7 @@ class TenantHasActiveSlotsError(RuntimeError):
     pass
 
 
-@dataclass
+@dataclass(slots=True)
 class TenantStats:
     """Statistics for a single tenant."""
 
@@ -61,7 +61,7 @@ class TenantStats:
     waiting: int
 
 
-@dataclass
+@dataclass(slots=True)
 class SemaphoreStats:
     """Overall semaphore statistics."""
 
@@ -73,7 +73,7 @@ class SemaphoreStats:
     tenants: dict[str, TenantStats] = field(default_factory=dict)
 
 
-@dataclass
+@dataclass(slots=True)
 class _TenantState:
     """Internal state for a tenant."""
 
@@ -93,6 +93,8 @@ class TenantContext:
                 # slot acquired
                 ...
     """
+
+    __slots__ = ("_semaphore", "_tenant_id")
 
     def __init__(self, semaphore: FairShareSemaphore, tenant_id: str) -> None:
         self._semaphore = semaphore
@@ -122,10 +124,13 @@ class TenantContext:
 class _SlotAcquisition:
     """Internal context manager for slot acquisition."""
 
+    __slots__ = ("_semaphore", "_tenant_id", "_acquired", "_waiting_registered")
+
     def __init__(self, semaphore: FairShareSemaphore, tenant_id: str) -> None:
         self._semaphore = semaphore
         self._tenant_id = tenant_id
         self._acquired = False
+        self._waiting_registered = False
 
     async def __aenter__(self) -> _SlotAcquisition:
         sem = self._semaphore
@@ -141,11 +146,11 @@ class _SlotAcquisition:
             if tenant.closing:
                 raise TenantNotRegisteredError(f"Tenant '{self._tenant_id}' is closing.")
             tenant.waiting += 1
+            self._waiting_registered = True
 
         try:
             while True:
                 async with sem._lock:
-                    share = sem._calculate_share()
                     tenant_state = sem._tenants.get(self._tenant_id)
 
                     if tenant_state is None or tenant_state.closing:
@@ -153,11 +158,15 @@ class _SlotAcquisition:
                             f"Tenant '{self._tenant_id}' was unregistered."
                         )
 
+                    share = sem._calculate_share()
+
                     # Check if we can acquire
                     if tenant_state.active_slots < share and sem._available > 0:
                         sem._available -= 1
                         tenant_state.active_slots += 1
+                        tenant_state.waiting = max(0, tenant_state.waiting - 1)
                         self._acquired = True
+                        self._waiting_registered = False
                         return self
 
                     # Need to wait - add to queue
@@ -176,11 +185,14 @@ class _SlotAcquisition:
                     raise
 
         except (asyncio.CancelledError, Exception):
-            # Rollback waiting count on any error
+            # Rollback on any error
             async with sem._lock:
                 tenant_state = sem._tenants.get(self._tenant_id)
-                if tenant_state:
+
+                # Rollback waiting count if we registered but didn't acquire
+                if self._waiting_registered and tenant_state:
                     tenant_state.waiting = max(0, tenant_state.waiting - 1)
+                    self._waiting_registered = False
 
                 # Rollback acquisition if it happened
                 if self._acquired:
@@ -190,14 +202,6 @@ class _SlotAcquisition:
                     self._acquired = False
                     sem._notify_waiters()
             raise
-
-        finally:
-            # Decrement waiting count on successful acquisition
-            if self._acquired:
-                async with sem._lock:
-                    tenant_state = sem._tenants.get(self._tenant_id)
-                    if tenant_state:
-                        tenant_state.waiting = max(0, tenant_state.waiting - 1)
 
     async def __aexit__(
         self,
@@ -247,8 +251,18 @@ class FairShareSemaphore:
         - With 10 slots and 2 demanding tenants: each gets up to 5 slots
         - With 10 slots and 5 demanding tenants: each gets up to 2 slots
         - Shares are recalculated dynamically as tenants join/leave
-        - Only "demanding" tenants (active_slots > 0 or waiting > 0) count for share calculation
+        - Only "demanding" tenants (active_slots > 0 or waiting > 0) count
     """
+
+    __slots__ = (
+        "_max_slots",
+        "_min_share",
+        "_share_calculator",
+        "_lock",
+        "_available",
+        "_tenants",
+        "_waiters",
+    )
 
     def __init__(
         self,
@@ -303,28 +317,30 @@ class FairShareSemaphore:
             return
 
         share = self._calculate_share()
-        notified: list[tuple[str, asyncio.Future[None]]] = []
+        to_remove: list[tuple[str, asyncio.Future[None]]] = []
 
         for tenant_id, waiter in self._waiters:
             if waiter.done():
-                notified.append((tenant_id, waiter))
+                to_remove.append((tenant_id, waiter))
                 continue
 
             tenant_state = self._tenants.get(tenant_id)
             if tenant_state is None or tenant_state.closing:
                 waiter.cancel()
-                notified.append((tenant_id, waiter))
+                to_remove.append((tenant_id, waiter))
                 continue
 
             # Check if tenant can acquire based on fair share
+            # Only wake up as many as we have available slots
             if tenant_state.active_slots < share and self._available > 0:
                 waiter.set_result(None)
-                notified.append((tenant_id, waiter))
-                # Don't decrement available here - let __aenter__ do it
-                # This ensures atomicity
+                to_remove.append((tenant_id, waiter))
+                # Break after waking one waiter per available slot
+                # This prevents thundering herd
+                break
 
-        # Remove notified waiters
-        for item in notified:
+        # Remove processed waiters
+        for item in to_remove:
             try:
                 self._waiters.remove(item)
             except ValueError:
@@ -370,8 +386,8 @@ class FairShareSemaphore:
             elif force:
                 # Force unregister - WARNING: leaks slots
                 logger.warning(
-                    f"Force unregistering tenant '{tenant_id}' with {tenant_state.active_slots} "
-                    f"active slots - slots will be leaked!"
+                    f"Force unregistering tenant '{tenant_id}' with "
+                    f"{tenant_state.active_slots} active slots - slots will be leaked!"
                 )
                 del self._tenants[tenant_id]
             else:

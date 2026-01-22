@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2025-01-22
+
+### Fixed
+- **Double waiting decrement bug**: Fixed issue where `waiting` counter could be decremented twice on error if acquisition was successful. Added `_waiting_registered` flag to track state properly.
+- **Thundering herd in `_notify_waiters()`**: Now wakes only one waiter per call instead of all eligible waiters, preventing inefficient mass wakeups.
+
+### Changed
+- Added `__slots__` to all classes (`TenantContext`, `_SlotAcquisition`, `FairShareSemaphore`) and dataclasses for better memory efficiency.
+- Moved `waiting` decrement into the acquire success path for cleaner state management.
+
 ## [0.2.0] - 2025-01-22
 
 ### Fixed
