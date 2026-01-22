@@ -211,7 +211,7 @@ semaphore = FairShareSemaphore(
 
 ```bash
 # Clone the repo
-git clone https://github.com/yourusername/aio-fairshare
+git clone https://github.com/ProdyRodion/aio-fairshare
 cd aio-fairshare
 
 # Install dependencies with Poetry
